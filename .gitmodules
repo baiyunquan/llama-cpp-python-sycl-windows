@@ -1,0 +1,6 @@
+[submodule "oneapi-ci"]
+	path = oneapi-ci
+	url = git@github.com:oneapi-src/oneapi-ci.git
+[submodule "llama-cpp-python"]
+	path = llama-cpp-python
+	url = git@github.com:abetlen/llama-cpp-python.git

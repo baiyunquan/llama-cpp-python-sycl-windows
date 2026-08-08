@@ -8,7 +8,8 @@ name: Build Wheels (SYCL)
 # 关键点：
 #   - oneAPI 2026.1 离线安装包（与 oneapi-ci build_all.yml 相同来源）
 #   - 组件用冒号(:)分隔（Intel bootstrapper 要求，见 oneapi-ci#71）
-#   - oneAPI 安装目录做 GitHub Actions 缓存，加速二次运行
+#   - oneAPI 每次全新安装：GitHub cache 恢复会丢失 latest 符号链接/交接点，
+#     导致 setvars 找不到 icx（已踩坑）；编译缓存改用 ccache（GGML_CCACHE=ON）
 #   - scikit-build-core 固定 0.10.7（新版本在 SYCL 环境下有已知 bug）
 #   - GGML_ONEDNN=off（兼容性更稳定）
 #   - 修复 vendor/llama.cpp/common/jinja/utils.h 的 UTF-8 BOM（MSVC 中文编码问题）
@@ -33,10 +34,6 @@ env:
   # 注意：Intel Windows bootstrapper 的多组件分隔符是冒号(:) —— 见
   # https://github.com/oneapi-src/oneapi-ci/issues/71 （逗号/分号只会装第一个组件）
   WINDOWS_SYCL_COMPONENTS: intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.dnnl:intel.oneapi.win.tbb.devel
-  COMPILER_VERSION: 2026.1
-  TBB_VERSION: 2023.1
-  # 修改此值可强制使 oneAPI 缓存失效
-  CACHE_NUMBER: 1
 
 jobs:
   build_sycl_wheel:
@@ -65,41 +62,19 @@ jobs:
         with:
           python-version: '3.13'
 
-      # ---- Intel oneAPI（安装 + 缓存）--------------------------------------
-      # actions/cache 的 key 不允许包含逗号，先用一步把组件列表里的逗号/分号/冒号换成 '+'
-      - name: Sanitize oneAPI components for cache key
-        shell: pwsh
-        run: |
-          $clean = $env:WINDOWS_SYCL_COMPONENTS -replace '[,;:]', '+'
-          "SYCL_COMPONENTS_KEY=$clean" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
-
-      - name: Cache Intel oneAPI installation
-        id: cache-oneapi
-        uses: actions/cache@v4
+      # 编译缓存：ccache 跨运行缓存 SYCL 编译产物，避免每次全量重编
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1
         with:
-          path: |
-            C:\Program Files (x86)\Intel\oneAPI\setvars-vcvarsall.bat
-            C:\Program Files (x86)\Intel\oneAPI\compiler
-            C:\Program Files (x86)\Intel\oneAPI\mkl
-            C:\Program Files (x86)\Intel\oneAPI\dnnl
-            C:\Program Files (x86)\Intel\oneAPI\tbb
-            C:\Windows\System32\OpenCL.dll
-          key: sycl-oneapi-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_TOOLKIT_URL }}-${{ env.SYCL_COMPONENTS_KEY }}
+          max-size: 2G
 
+      # ---- Intel oneAPI（每次全新安装）------------------------------------
+      # 不用 actions/cache 缓存 oneAPI：缓存恢复会丢失 latest 符号链接/交接点，
+      # 导致 setvars 找不到 icx（已踩坑）。每次全新安装（约 5 分钟），
+      # 编译缓存交给上面的 ccache。
       - name: Install Intel oneAPI (DPC++/C++, oneMKL, oneDNN, oneTBB)
-        if: steps.cache-oneapi.outputs.cache-hit != 'true'
         shell: bash
         run: oneapi-ci/scripts/install_windows.bat "$WINDOWS_TOOLKIT_URL" "$WINDOWS_SYCL_COMPONENTS"
-
-      - name: Restore oneAPI registry entries (cache hit)
-        if: steps.cache-oneapi.outputs.cache-hit == 'true'
-        shell: bash
-        run: oneapi-ci/scripts/restore_registry.bat "$COMPILER_VERSION" "$TBB_VERSION"
-
-      - name: Exclude unused oneAPI files from cache
-        if: steps.cache-oneapi.outputs.cache-hit != 'true'
-        shell: bash
-        run: oneapi-ci/scripts/cache_exclude_windows.sh
 
       - name: Inspect oneAPI installation
         shell: pwsh
@@ -197,12 +172,12 @@ jobs:
       - name: Build SYCL wheel
         shell: cmd
         run: |
-          rem 用 setvars-vcvarsall.bat（缓存里有），它会同时初始化 VS + oneAPI 环境
-          call "C:\Program Files (x86)\Intel\oneAPI\setvars-vcvarsall.bat" vs2022
+          rem 全新安装后 setvars.bat 一定存在；--force 会顺带初始化 VS 环境
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" --force
           if errorlevel 1 exit /b 1
           icx --version
           set CMAKE_GENERATOR=Ninja
-          set CMAKE_ARGS=-DCMAKE_BUILD_TYPE=Release -DGGML_SYCL=on -DGGML_ONEDNN=off -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx -DGGML_SYCL_TARGET=INTEL -Wno-dev
+          set CMAKE_ARGS=-DCMAKE_BUILD_TYPE=Release -DGGML_SYCL=on -DGGML_ONEDNN=off -DGGML_CCACHE=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx -DGGML_SYCL_TARGET=INTEL -Wno-dev
           rem 让 CMake 能找到 oneMKL 的 MKLConfig.cmake
           set CMAKE_PREFIX_PATH=C:\Program Files (x86)\Intel\oneAPI\mkl\latest
           cd llama-cpp-python

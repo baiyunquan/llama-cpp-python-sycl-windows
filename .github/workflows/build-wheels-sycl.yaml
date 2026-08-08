@@ -97,6 +97,23 @@ jobs:
         shell: bash
         run: oneapi-ci/scripts/cache_exclude_windows.sh
 
+      - name: Inspect oneAPI installation
+        shell: pwsh
+        run: |
+          $root = 'C:\Program Files (x86)\Intel\oneAPI'
+          if (Test-Path $root) {
+            Write-Host '--- oneAPI root ---'
+            Get-ChildItem $root | ForEach-Object { Write-Host "  $($_.Name)" }
+            Write-Host '--- mkl cmake config ---'
+            if (Test-Path "$root\mkl\latest\lib\cmake") {
+              Get-ChildItem "$root\mkl\latest\lib\cmake" | ForEach-Object { Write-Host "  $($_.Name)" }
+            } else {
+              Write-Host '  MKL cmake dir NOT found'
+            }
+          } else {
+            Write-Host "oneAPI root NOT found: $root"
+          }
+
       # ---- 构建准备 --------------------------------------------------------
       - name: Install Python build dependencies
         shell: pwsh
@@ -145,6 +162,8 @@ jobs:
           icx --version
           set CMAKE_GENERATOR=Ninja
           set CMAKE_ARGS=-DCMAKE_BUILD_TYPE=Release -DGGML_SYCL=on -DGGML_ONEDNN=off -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx -DGGML_SYCL_TARGET=INTEL -Wno-dev
+          rem 让 CMake 能找到 oneMKL 的 MKLConfig.cmake
+          set CMAKE_PREFIX_PATH=C:\Program Files (x86)\Intel\oneAPI\mkl\latest
           cd llama-cpp-python
           python -m build --wheel --no-isolation
           if errorlevel 1 exit /b 1

@@ -28,7 +28,8 @@ env:
   # oneAPI 2026.1 offline installer（与 oneapi-ci 使用的来源一致）
   WINDOWS_TOOLKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/4144bec3-82ce-4672-bd71-5c93a79cd5e7/intel-oneapi-toolkit-2026.1.0.191_offline.exe
   # SYCL 编译所需组件：编译器(SYCL 运行时 + DPC++ Library) + oneMKL + oneDNN + oneTBB
-  WINDOWS_SYCL_COMPONENTS: intel.oneapi.win.cpp-dpcpp-common,intel.oneapi.win.mkl.devel,intel.oneapi.win.dnnl,intel.oneapi.win.tbb.devel
+  # 注意：Intel Windows bootstrapper 的多组件分隔符是分号(;)，逗号只装第一个组件
+  WINDOWS_SYCL_COMPONENTS: intel.oneapi.win.cpp-dpcpp-common;intel.oneapi.win.mkl.devel;intel.oneapi.win.dnnl;intel.oneapi.win.tbb.devel
   COMPILER_VERSION: 2026.1
   TBB_VERSION: 2023.1
   # 修改此值可强制使 oneAPI 缓存失效
@@ -62,11 +63,11 @@ jobs:
           python-version: '3.13'
 
       # ---- Intel oneAPI（安装 + 缓存）--------------------------------------
-      # actions/cache 的 key 不允许包含逗号，先用一步把组件列表里的逗号换成 '+'
+      # actions/cache 的 key 不允许包含逗号，先用一步把组件列表里的逗号/分号换成 '+'
       - name: Sanitize oneAPI components for cache key
         shell: pwsh
         run: |
-          $clean = $env:WINDOWS_SYCL_COMPONENTS -replace ',', '+'
+          $clean = $env:WINDOWS_SYCL_COMPONENTS -replace '[,;]', '+'
           "SYCL_COMPONENTS_KEY=$clean" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
 
       - name: Cache Intel oneAPI installation
@@ -104,12 +105,18 @@ jobs:
           if (Test-Path $root) {
             Write-Host '--- oneAPI root ---'
             Get-ChildItem $root | ForEach-Object { Write-Host "  $($_.Name)" }
-            Write-Host '--- mkl cmake config ---'
-            if (Test-Path "$root\mkl\latest\lib\cmake") {
-              Get-ChildItem "$root\mkl\latest\lib\cmake" | ForEach-Object { Write-Host "  $($_.Name)" }
+            Write-Host '--- mkl ---'
+            if (Test-Path "$root\mkl") {
+              Get-ChildItem "$root\mkl" | ForEach-Object { Write-Host "  mkl/$($_.Name)" }
+              Write-Host '--- mkl cmake ---'
+              if (Test-Path "$root\mkl\latest\lib\cmake") {
+                Get-ChildItem "$root\mkl\latest\lib\cmake" | ForEach-Object { Write-Host "  $($_.Name)" }
+              } else { Write-Host '  mkl/latest/lib/cmake NOT found' }
             } else {
-              Write-Host '  MKL cmake dir NOT found'
+              Write-Host '  MKL NOT installed'
             }
+            Write-Host '--- dnnl ---'
+            if (Test-Path "$root\dnnl") { Write-Host '  dnnl installed' } else { Write-Host '  dnnl NOT installed' }
           } else {
             Write-Host "oneAPI root NOT found: $root"
           }

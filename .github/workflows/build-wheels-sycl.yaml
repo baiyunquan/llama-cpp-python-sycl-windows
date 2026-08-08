@@ -2,15 +2,17 @@ name: Build Wheels (SYCL)
 
 # 基于 sycl-build-guide.md 的手动编译流程自动化为 GitHub Actions。
 # 触发方式：推送任意 tag（类似现有 Vulkan / CUDA wheel 工作流）。
-# 产出：Windows x64 + Python 3.13 的自包含 SYCL wheel（方案 B，~109MB，含 oneAPI 运行时 DLL）。
+# 产出：Windows x64 + Python 3.13 的自包含 SYCL wheel（方案 B，含 oneAPI 运行时 DLL，
+#       目标机无需预装 oneAPI）。
 #
 # 关键点：
 #   - oneAPI 2026.1 离线安装包（与 oneapi-ci build_all.yml 相同来源）
-#   - 组件：DPC++/C++ Compiler + oneMKL + oneDNN + oneTBB
+#   - 组件用冒号(:)分隔（Intel bootstrapper 要求，见 oneapi-ci#71）
 #   - oneAPI 安装目录做 GitHub Actions 缓存，加速二次运行
 #   - scikit-build-core 固定 0.10.7（新版本在 SYCL 环境下有已知 bug）
 #   - GGML_ONEDNN=off（兼容性更稳定）
 #   - 修复 vendor/llama.cpp/common/jinja/utils.h 的 UTF-8 BOM（MSVC 中文编码问题）
+#   - 方案 B：手动把 oneAPI 运行时 DLL（MKL/SYCL/OpenCL/OpenMP）复制进 llama_cpp/lib
 
 on:
   push:
@@ -160,6 +162,36 @@ jobs:
             Write-Host '::error::Could not parse __version__ from llama_cpp/__init__.py'
             exit 1
           }
+
+      # ---- 方案 B：把 oneAPI 运行时 DLL 打进 wheel（自包含）----------------
+      # CMake 的 $<TARGET_RUNTIME_DLLS> 无法自动捕获 MKL/SYCL 这些 imported 运行时库，
+      # 需手动把 oneAPI 运行时 DLL 复制进 llama_cpp/lib，让目标机无需安装 oneAPI。
+      - name: Bundle oneAPI runtime DLLs (self-contained wheel)
+        shell: pwsh
+        run: |
+          $oneapi = 'C:\Program Files (x86)\Intel\oneAPI'
+          $lib = 'llama-cpp-python/llama_cpp/lib'
+          New-Item -ItemType Directory -Force $lib | Out-Null
+
+          # oneMKL SYCL 运行时（mkl_sycl_blas / mkl_core / 线程层 / ISA 分发）
+          $mklBin = "$oneapi\mkl\latest\bin"
+          if (Test-Path $mklBin) {
+            Get-ChildItem $mklBin -Filter 'mkl_*.dll' | Copy-Item -Destination $lib -Force
+          }
+          # SYCL 运行时 + OpenCL
+          $compBin = "$oneapi\compiler\latest\bin"
+          if (Test-Path $compBin) {
+            Copy-Item "$compBin\sycl*.dll" $lib -Force -ErrorAction SilentlyContinue
+            Copy-Item "$compBin\OpenCL.dll" $lib -Force -ErrorAction SilentlyContinue
+          }
+          # OpenMP 运行时（libomp）
+          $ompBin = "$oneapi\compiler\latest\bin\compiler"
+          if (Test-Path $ompBin) {
+            Get-ChildItem $ompBin -Filter 'libomp*.dll' | Copy-Item -Destination $lib -Force
+          }
+
+          Write-Host '--- oneAPI runtime DLLs bundled into llama_cpp/lib ---'
+          Get-ChildItem $lib -Filter *.dll | Sort-Object Name | ForEach-Object { Write-Host "  $($_.Name)" }
 
       # ---- SYCL 编译 --------------------------------------------------------
       - name: Build SYCL wheel

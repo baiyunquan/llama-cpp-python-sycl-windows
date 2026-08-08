@@ -138,36 +138,6 @@ jobs:
             exit 1
           }
 
-      # ---- 方案 B：把 oneAPI 运行时 DLL 打进 wheel（自包含）----------------
-      # CMake 的 $<TARGET_RUNTIME_DLLS> 无法自动捕获 MKL/SYCL 这些 imported 运行时库，
-      # 需手动把 oneAPI 运行时 DLL 复制进 llama_cpp/lib，让目标机无需安装 oneAPI。
-      - name: Bundle oneAPI runtime DLLs (self-contained wheel)
-        shell: pwsh
-        run: |
-          $oneapi = 'C:\Program Files (x86)\Intel\oneAPI'
-          $lib = 'llama-cpp-python/llama_cpp/lib'
-          New-Item -ItemType Directory -Force $lib | Out-Null
-
-          # oneMKL SYCL 运行时（mkl_sycl_blas / mkl_core / 线程层 / ISA 分发）
-          $mklBin = "$oneapi\mkl\latest\bin"
-          if (Test-Path $mklBin) {
-            Get-ChildItem $mklBin -Filter 'mkl_*.dll' | Copy-Item -Destination $lib -Force
-          }
-          # SYCL 运行时 + OpenCL
-          $compBin = "$oneapi\compiler\latest\bin"
-          if (Test-Path $compBin) {
-            Copy-Item "$compBin\sycl*.dll" $lib -Force -ErrorAction SilentlyContinue
-            Copy-Item "$compBin\OpenCL.dll" $lib -Force -ErrorAction SilentlyContinue
-          }
-          # OpenMP 运行时（libomp）
-          $ompBin = "$oneapi\compiler\latest\bin\compiler"
-          if (Test-Path $ompBin) {
-            Get-ChildItem $ompBin -Filter 'libomp*.dll' | Copy-Item -Destination $lib -Force
-          }
-
-          Write-Host '--- oneAPI runtime DLLs bundled into llama_cpp/lib ---'
-          Get-ChildItem $lib -Filter *.dll | Sort-Object Name | ForEach-Object { Write-Host "  $($_.Name)" }
-
       # ---- SYCL 编译 --------------------------------------------------------
       - name: Build SYCL wheel
         shell: cmd
@@ -183,10 +153,96 @@ jobs:
           cd llama-cpp-python
           python -m build --wheel --no-isolation
           if errorlevel 1 exit /b 1
-          if not exist ..\wheelhouse mkdir ..\wheelhouse
-          copy /y dist\*.whl ..\wheelhouse\
           cd ..
-          dir wheelhouse
+
+      # ---- 方案 B：构建完成后把 oneAPI 运行时 DLL 打进 wheel（自包含）------
+      # CMake 的 $<TARGET_RUNTIME_DLLS> 无法捕获 MKL/SYCL 这些 imported 运行时库，
+      # 因此构建完成后直接改写 wheel（zip 手术）：把 MKL/SYCL/OpenCL/OpenMP 运行时
+      # DLL 塞进 llama_cpp/lib 并更新 RECORD，让目标机无需安装 oneAPI。
+      - name: Bundle oneAPI runtime DLLs into wheel (self-contained)
+        shell: bash
+        run: |
+          python - <<'PYEOF'
+          import zipfile, shutil, os, sys, glob, hashlib, base64
+
+          wheel = glob.glob('llama-cpp-python/dist/*.whl')[0]
+          print('Processing wheel:', wheel)
+
+          oneapi = r'C:\Program Files (x86)\Intel\oneAPI'
+          lib_target = 'llama_cpp/lib/'
+
+          dlls = []
+          mkl_bin = os.path.join(oneapi, 'mkl', 'latest', 'bin')
+          if os.path.isdir(mkl_bin):
+              dlls += glob.glob(os.path.join(mkl_bin, 'mkl_*.dll'))
+          comp_bin = os.path.join(oneapi, 'compiler', 'latest', 'bin')
+          if os.path.isdir(comp_bin):
+              dlls += glob.glob(os.path.join(comp_bin, 'sycl*.dll'))
+              oc = os.path.join(comp_bin, 'OpenCL.dll')
+              if os.path.isfile(oc):
+                  dlls.append(oc)
+          omp_bin = os.path.join(oneapi, 'compiler', 'latest', 'bin', 'compiler')
+          if os.path.isdir(omp_bin):
+              dlls += glob.glob(os.path.join(omp_bin, 'libomp*.dll'))
+
+          seen, srcs = set(), []
+          for d in dlls:
+              b = os.path.basename(d)
+              if b not in seen:
+                  seen.add(b); srcs.append(d)
+          print('Bundling DLLs:', [os.path.basename(d) for d in srcs])
+          if not srcs:
+              print('WARNING: no oneAPI runtime DLLs found to bundle'); sys.exit(0)
+
+          tmp = os.path.join('llama-cpp-python', 'wheel_extract')
+          shutil.rmtree(tmp, ignore_errors=True)
+          os.makedirs(tmp, exist_ok=True)
+          with zipfile.ZipFile(wheel) as zin:
+              zin.extractall(tmp)
+
+          for dll in srcs:
+              dest = os.path.join(tmp, lib_target, os.path.basename(dll))
+              os.makedirs(os.path.dirname(dest), exist_ok=True)
+              shutil.copy2(dll, dest)
+
+          # 更新 RECORD
+          record_path = None
+          for root, dirs, files in os.walk(tmp):
+              if 'RECORD' in files:
+                  record_path = os.path.join(root, 'RECORD')
+          if record_path:
+              with open(record_path, 'r', newline='') as rf:
+                  lines = rf.read().splitlines()
+              names = {line.split(',')[0] for line in lines}
+              for dll in srcs:
+                  rel = lib_target + os.path.basename(dll)
+                  if rel in names:
+                      continue
+                  full = os.path.join(tmp, rel)
+                  size = os.path.getsize(full)
+                  h = hashlib.sha256()
+                  with open(full, 'rb') as fh:
+                      h.update(fh.read())
+                  digest = base64.urlsafe_b64encode(h.digest()).decode().rstrip('=')
+                  lines.append(f'{rel},sha256={digest},{size}')
+              with open(record_path, 'w', newline='') as rf:
+                  rf.write('\n'.join(lines) + '\n')
+
+          # 重新打包 wheel（覆盖原文件）
+          os.remove(wheel)
+          with zipfile.ZipFile(wheel, 'w', zipfile.ZIP_DEFLATED) as zout:
+              for root, dirs, files in os.walk(tmp):
+                  for f in files:
+                      full = os.path.join(root, f)
+                      rel = os.path.relpath(full, tmp).replace('\\', '/')
+                      zout.write(full, rel)
+          shutil.rmtree(tmp, ignore_errors=True)
+
+          # 复制最终 wheel 到 wheelhouse
+          os.makedirs('wheelhouse', exist_ok=True)
+          shutil.copy2(wheel, os.path.join('wheelhouse', os.path.basename(wheel)))
+          print('Done. Final wheel:', os.path.basename(wheel), round(os.path.getsize(wheel)/1e6, 1), 'MB')
+          PYEOF
 
       - name: Verify self-contained wheel
         shell: pwsh

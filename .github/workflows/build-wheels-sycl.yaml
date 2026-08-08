@@ -1,0 +1,178 @@
+name: Build Wheels (SYCL)
+
+# 基于 sycl-build-guide.md 的手动编译流程自动化为 GitHub Actions。
+# 触发方式：推送任意 tag（类似现有 Vulkan / CUDA wheel 工作流）。
+# 产出：Windows x64 + Python 3.13 的自包含 SYCL wheel（方案 B，~109MB，含 oneAPI 运行时 DLL）。
+#
+# 关键点：
+#   - oneAPI 2026.1 离线安装包（与 oneapi-ci build_all.yml 相同来源）
+#   - 组件：DPC++/C++ Compiler + oneMKL + oneDNN + oneTBB
+#   - oneAPI 安装目录做 GitHub Actions 缓存，加速二次运行
+#   - scikit-build-core 固定 0.10.7（新版本在 SYCL 环境下有已知 bug）
+#   - GGML_ONEDNN=off（兼容性更稳定）
+#   - 修复 vendor/llama.cpp/common/jinja/utils.h 的 UTF-8 BOM（MSVC 中文编码问题）
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sycl-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # oneAPI 2026.1 offline installer（与 oneapi-ci 使用的来源一致）
+  WINDOWS_TOOLKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/4144bec3-82ce-4672-bd71-5c93a79cd5e7/intel-oneapi-toolkit-2026.1.0.191_offline.exe
+  # SYCL 编译所需组件：编译器(SYCL 运行时 + DPC++ Library) + oneMKL + oneDNN + oneTBB
+  WINDOWS_SYCL_COMPONENTS: intel.oneapi.win.cpp-dpcpp-common,intel.oneapi.win.mkl.devel,intel.oneapi.win.dnnl,intel.oneapi.win.tbb.devel
+  COMPILER_VERSION: 2026.1
+  TBB_VERSION: 2023.1
+  # 修改此值可强制使 oneAPI 缓存失效
+  CACHE_NUMBER: 1
+
+jobs:
+  build_sycl_wheel:
+    name: Build SYCL wheel on windows-2022
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      # ---- Intel oneAPI（安装 + 缓存）--------------------------------------
+      - name: Cache Intel oneAPI installation
+        id: cache-oneapi
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Program Files (x86)\Intel\oneAPI\setvars-vcvarsall.bat
+            C:\Program Files (x86)\Intel\oneAPI\compiler
+            C:\Program Files (x86)\Intel\oneAPI\mkl
+            C:\Program Files (x86)\Intel\oneAPI\dnnl
+            C:\Program Files (x86)\Intel\oneAPI\tbb
+            C:\Windows\System32\OpenCL.dll
+          key: sycl-oneapi-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_TOOLKIT_URL }}-${{ env.WINDOWS_SYCL_COMPONENTS }}
+
+      - name: Install Intel oneAPI (DPC++/C++, oneMKL, oneDNN, oneTBB)
+        if: steps.cache-oneapi.outputs.cache-hit != 'true'
+        shell: bash
+        run: oneapi-ci/scripts/install_windows.bat "$WINDOWS_TOOLKIT_URL" "$WINDOWS_SYCL_COMPONENTS"
+
+      - name: Restore oneAPI registry entries (cache hit)
+        if: steps.cache-oneapi.outputs.cache-hit == 'true'
+        shell: bash
+        run: oneapi-ci/scripts/restore_registry.bat "$COMPILER_VERSION" "$TBB_VERSION"
+
+      - name: Exclude unused oneAPI files from cache
+        if: steps.cache-oneapi.outputs.cache-hit != 'true'
+        shell: bash
+        run: oneapi-ci/scripts/cache_exclude_windows.sh
+
+      # ---- 构建准备 --------------------------------------------------------
+      - name: Install Python build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          # scikit-build-core 固定 0.10.7（新版本在 SYCL 环境存在兼容性问题）
+          python -m pip install build wheel ninja scikit-build-core==0.10.7
+
+      - name: Fix MSVC UTF-8 encoding (jinja utils.h)
+        shell: pwsh
+        run: |
+          $path = 'llama-cpp-python/vendor/llama.cpp/common/jinja/utils.h'
+          if (Test-Path $path) {
+            $content = Get-Content -Path $path -Raw -Encoding UTF8
+            $utf8bom = New-Object System.Text.UTF8Encoding $true
+            [System.IO.File]::WriteAllText((Resolve-Path $path), $content, $utf8bom)
+            Write-Host 'Converted utils.h to UTF-8 with BOM'
+          } else {
+            Write-Host 'utils.h not found, skipping encoding fix'
+          }
+
+      - name: Compute wheel version (+sycl local tag)
+        shell: pwsh
+        run: |
+          $content = Get-Content 'llama-cpp-python/llama_cpp/__init__.py' -Raw
+          if ($content -match '__version__\s*=\s*"([^"]+)"') {
+            $base = $Matches[1] -replace '\+.*$', ''
+            $ver = "$base+sycl"
+            "WHEEL_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+            Write-Host "Wheel version: $ver"
+          } else {
+            Write-Host '::error::Could not parse __version__ from llama_cpp/__init__.py'
+            exit 1
+          }
+
+      # ---- SYCL 编译 --------------------------------------------------------
+      - name: Build SYCL wheel
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" --force
+          if errorlevel 1 exit /b 1
+          icx --version
+          set CMAKE_GENERATOR=Ninja
+          set CMAKE_ARGS=-DCMAKE_BUILD_TYPE=Release -DGGML_SYCL=on -DGGML_ONEDNN=off -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx -DGGML_SYCL_TARGET=INTEL -Wno-dev
+          cd llama-cpp-python
+          python -m build --wheel --no-isolation -C version=%WHEEL_VERSION%
+          if errorlevel 1 exit /b 1
+          if not exist ..\wheelhouse mkdir ..\wheelhouse
+          copy /y dist\*.whl ..\wheelhouse\
+          cd ..
+          dir wheelhouse
+
+      - name: Verify self-contained wheel
+        shell: pwsh
+        run: |
+          $wheel = Get-ChildItem 'wheelhouse\*.whl' | Select-Object -First 1
+          if (-not $wheel) { Write-Host '::error::No wheel produced'; exit 1 }
+          Write-Host "Wheel: $($wheel.Name) ($([math]::Round($wheel.Length/1MB, 1)) MB)"
+          $tmp = Join-Path $env:TEMP 'wheelcheck'
+          New-Item -ItemType Directory -Force $tmp | Out-Null
+          Expand-Archive -Path $wheel.FullName -DestinationPath $tmp -Force
+          $lib = Join-Path $tmp 'llama_cpp\lib'
+          if (Test-Path $lib) {
+            Get-ChildItem $lib -Filter *.dll | ForEach-Object { Write-Host "  $($_.Name)" }
+          } else {
+            Write-Host '  (no lib dir)'
+          }
+          Remove-Item $tmp -Recurse -Force
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-sycl-windows-2022
+          path: ./wheelhouse/*.whl
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [build_sycl_wheel]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          path: dist
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

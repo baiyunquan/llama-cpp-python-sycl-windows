@@ -73,7 +73,7 @@ jobs:
             C:\Program Files (x86)\Intel\oneAPI\dnnl
             C:\Program Files (x86)\Intel\oneAPI\tbb
             C:\Windows\System32\OpenCL.dll
-          key: sycl-oneapi-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_TOOLKIT_URL }}-${{ env.WINDOWS_SYCL_COMPONENTS }}
+          key: sycl-oneapi-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_TOOLKIT_URL }}-${{ replace(env.WINDOWS_SYCL_COMPONENTS, ',', '+') }}
 
       - name: Install Intel oneAPI (DPC++/C++, oneMKL, oneDNN, oneTBB)
         if: steps.cache-oneapi.outputs.cache-hit != 'true'
